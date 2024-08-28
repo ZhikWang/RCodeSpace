@@ -1,2 +1,3 @@
 # RCodeSpace
-This is the Code Space for fundamental microbial ecology research.
+This is the R Code Space for fundamental microbial ecology research.
+
