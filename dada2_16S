@@ -1,0 +1,136 @@
+# Dada2 pipeline for CleanData from the sequencing company
+
+# locate your sequencing reads files 
+path <- "D:/ZAFU/Research/DataAnalysis/AmpliconSeq.0115/Seq5_16s_150_X101SC23061922-Z01-J005/00.CleanData/EffectiveData/"
+mergers <- as.list(sort(list.files(path, pattern = ".effective.fastq", full.names = TRUE)))
+
+# Construct sequence table
+library(dada2)
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+
+#Remove chimeras
+# 
+seqtab.nochim <- removeBimeraDenovo(seqtab, method = "consensus", multithread = TRUE, verbose = TRUE)
+dim(seqtab.nochim)
+sum(seqtab.nochim)/sum(seqtab)
+
+## assign taxonomy
+
+taxa <- assignTaxonomy(seqtab.nochim, "D:/ZAFU/Research/DataAnalysis/Rstudio/silva_nr99_v138.1_train_set.fa.gz", 
+                       multithread=TRUE)
+
+# add species 
+taxa.ad <- addSpecies(taxa, "D:/ZAFU/Research/DataAnalysis/Rstudio/silva_species_assignment_v138.1.fa.gz")
+
+## alternatively: using  IdTaxa taxonomic classification method 
+library(DECIPHER)
+dna1 <- DNAStringSet(getSequences(seqtab.nochim)) # Create a DNAStringSet from the ASVs
+load("D:/ZAFU/Research/DataAnalysis/SILVA_SSU_r138_2019.RData") # CHANGE TO THE PATH OF YOUR TRAINING SET
+ids1 <- IdTaxa(dna1, trainingSet, strand="top", processors=NULL, verbose=FALSE) # use all processors
+ranks <- c("domain", "phylum", "class", "order", "family", "genus", "species") # ranks of interest
+# Convert the output object of class "Taxa" to a matrix analogous to the output from assignTaxonomy
+taxid1 <- t(sapply(ids1, function(x) {
+  m <- match(ranks, x$rank)
+  taxa <- x$taxon[m]
+  taxa[startsWith(taxa, "unclassified_")] <- NA
+  taxa
+}))
+colnames(taxid1) <- ranks
+rownames(taxid1) <- getSequences(seqtab.nochim)
+taxa_leaf <- as.data.frame(taxid1)
+
+# Removing sequence rownames for display only
+
+taxa.print1 <- as.data.frame(taxa)
+rownames(taxa.print1) <- paste0("ASV",rep(1:290096))
+head(taxa.print1)
+
+
+# #Track reads through the pipeline
+#
+getN <- function(x) sum(getUniques(x))
+track <- cbind(sapply(mergers, getN), rowSums(seqtab.nochim))
+
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c( "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+
+# create ASV table
+
+ASV.table <- seqtab.nochim
+colnames(ASV.table) <- paste0("ASV",rep(1:290096))# change the number based on your data frame, by dim(df)
+ASV.table <- as.data.frame(ASV.table)
+rownames(ASV.table) <- paste0("Sample",rep(1:150))
+
+# export the ASV table
+write.csv(ASV.table,"ASVtable_16S_nation.csv")
+
+# for the leaf sample, we need to remove the Chloroplast
+which(taxa.print1$Order == "Chloroplast")
+taxa.print.filter <- taxa.print1[taxa.print1$Order != "Chloroplast",]
+taxa.print.filter <- taxa.print.filter[-which(is.na(taxa.print.filter$Kingdom)),]
+
+# filter the asv table accordingly
+ASV.table.filter <- as.data.frame(ASV.table)[rownames(taxa.print.filter),] # this causes a lot of NAs, pls remove them
+ASV.table.filter <- ASV.table.filter[which(rowSums(ASV.table.filter) != "NA"),]
+write.csv(ASV.table.filter,"ASVtable_filter_16S_leaf_nation.csv")
+
+# export the taxa information as csv table
+write.csv(taxa.print.filter,"taxa_filtered_16S_leaf_nation.csv")
+
+
+#build the phyloseq object 
+metadata_leaf <- read_excel("metadata_leaf.xlsx") # write a metadata file for treatments, samples, etc.
+rownames(metadata_leaf) <- NULL
+View(metadata_leaf)
+
+library(phyloseq)
+ps.16s.nation <- phyloseq(otu_table(ASV.table.filter, taxa_are_rows=F), 
+                      sample_data(metadata_leaf), 
+                      tax_table(as.matrix(taxa.print.filter)),
+                      phy_tree(ASV.table.filter))
+
+# The following scripts are for ASV table that contains the DNA sequence information, such as 'seqtab.nochim'
+# dna <- Biostrings::DNAStringSet(taxa_names(ps.16s.nation))
+# names(dna) <- taxa_names(ps.16s.nation)
+# ps <- merge_phyloseq(ps.16s.nation, dna)
+# taxa_names(ps.16s.nation) <- paste0("ASV", seq(ntaxa(ps.16s.nation)))
+
+
+# Plot
+
+# a quick plot of alpha diversity
+plot_richness(ps.16s.nation, x="Site", measures=c("Shannon", "Simpson"), color="Age")
+plot_richness(ps.16s.nation, x="Age", measures=c("Shannon", "Simpson"), color="Age")
+
+# # Transform data to proportions as appropriate for Bray-Curtis distances
+ps.prop <- transform_sample_counts(ps.16s.nation, function(otu) otu/sum(otu))
+ord.nmds.bray <- ordinate(ps.prop, method="NMDS", distance="bray")
+
+# community structure
+plot_ordination(ps.prop, ord.nmds.bray, color="Site",shape = "Age" ,title="Bray NMDS",justDF = T)
+
+# Community composition
+
+top30 <- names(sort(taxa_sums(ps.16s.nation), decreasing=TRUE))[1:30]
+ps.16s.nation.top30 <- transform_sample_counts(ps.16s.nation, function(OTU) OTU/sum(OTU))
+ps.16s.nation.top30 <- prune_taxa(top30, ps.16s.nation.top30)
+plot_bar(ps.16s.nation.top30, x="Site", fill="Family") + 
+  facet_wrap(~Age, scales="free_x")
+
+# make a tree
+library(ape)
+random_tree <- rtree(ntaxa(ps.16s.nation.top30), rooted=TRUE, tip.label=taxa_names(ps.16s.nation.top30))
+plot(random_tree)
+ps.16s.nation.top30_tree <-  merge_phyloseq(ps.16s.nation.top30, metadata_leaf, random_tree)
+plot_tree(ps.16s.nation.top30_tree, 
+          color="Age", label.tips="taxa_names", ladderize="left", plot.margin=0.3)
+plot_tree(ps.16s.nation.top30_tree, 
+          color="Site", label.tips="taxa_names", ladderize="left", plot.margin=0.3)
+plot_tree(ps.16s.nation.top30_tree, 
+          color="Site", shape="Age", label.tips="taxa_names", ladderize="right", plot.margin=0.3)
+plot_heatmap(ps.16s.nation.top30_tree,taxa.label = "Phylum")
